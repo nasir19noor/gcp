@@ -1,0 +1,270 @@
+name: terraform
+
+# Deploys only the stages that changed, one job per stage.
+#   pull request   -> fmt + validate the changed stages (no GCP access: the
+#                     Workload Identity provider trusts main only)
+#   push to main   -> plan + apply the changed stages
+#   manual run     -> the stages you name (default: all), plan, apply, or
+#                     auth-check (proves the GitHub -> GCP sign-in works)
+#
+# The stages read each other's outputs through terraform_remote_state, so:
+#   - the jobs run one at a time, in ORDER, and stop at the first failure;
+#   - a changed stage also brings in the stages that read its outputs;
+#   - config.yaml, backend.conf or this file changing deploys every stage.
+# 0-bootstrap is applied by hand and only validated here. Stages listed in
+# ORDER that don't exist yet are skipped.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "1-org/**"
+      - "2-env/**"
+      - "3-networks/**"
+      - "4-projects/**"
+      - "config.yaml"
+      - "backend.conf"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    paths:
+      - "0-bootstrap/**"
+      - "1-org/**"
+      - "2-env/**"
+      - "3-networks/**"
+      - "4-projects/**"
+      - "config.yaml"
+      - "backend.conf"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan, plan and apply, or only check the sign-in"
+        type: choice
+        options: [plan, apply, auth-check]
+        default: plan
+      stages:
+        description: "Stage folders, space-separated, e.g. 1-org/envs/shared (empty = all)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.14.3"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  detect-changed-stages:
+    name: Detect changed stages
+    runs-on: ubuntu-latest
+    outputs:
+      stages: ${{ steps.find.outputs.stages }}
+      bootstrap: ${{ steps.find.outputs.bootstrap }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Find changed stages
+        id: find
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          INPUT_STAGES: ${{ inputs.stages }}
+        run: |
+          ORDER="
+            1-org/envs/shared
+            2-env/envs/production
+            2-env/envs/nonproduction
+            3-networks/envs/production
+            3-networks/envs/nonproduction
+            4-projects
+          "
+
+          # Stages that read each stage's outputs.
+          declare -A READERS=(
+            [1-org/envs/shared]="2-env/envs/production 2-env/envs/nonproduction 3-networks/envs/production 3-networks/envs/nonproduction 4-projects"
+            [2-env/envs/production]="3-networks/envs/production 4-projects"
+            [2-env/envs/nonproduction]="3-networks/envs/nonproduction 4-projects"
+            [3-networks/envs/production]="4-projects"
+            [3-networks/envs/nonproduction]="4-projects"
+          )
+
+          ZERO=0000000000000000000000000000000000000000
+          case "$EVENT" in
+            pull_request) BASE="$PR_BASE" ;;
+            push)         BASE="$BEFORE" ;;
+            *)            BASE="" ;;
+          esac
+
+          declare -A PICK=()
+          BOOT=false
+          if [ "$EVENT" = workflow_dispatch ]; then
+            for s in ${INPUT_STAGES:-$ORDER}; do PICK[$s]=1; done
+          elif [ -z "$BASE" ] || [ "$BASE" = "$ZERO" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "No usable base commit: every stage."
+            for s in $ORDER; do PICK[$s]=1; done
+          else
+            CHANGED=$(git diff --name-only "$BASE" "$AFTER")
+            echo "Changed files:"; echo "$CHANGED"
+            if echo "$CHANGED" | grep -qE '^(config\.yaml|backend\.conf|\.github/workflows/terraform\.yml)$'; then
+              for s in $ORDER; do PICK[$s]=1; done
+            fi
+            for s in $ORDER; do
+              if echo "$CHANGED" | grep -q "^$s/"; then PICK[$s]=1; fi
+            done
+            if echo "$CHANGED" | grep -q '^0-bootstrap/'; then BOOT=true; fi
+          fi
+
+          # Add the readers of every picked stage (ORDER is topological, so
+          # one pass in order reaches the whole chain).
+          for s in $ORDER; do
+            if [ -n "${PICK[$s]:-}" ]; then
+              for r in ${READERS[$s]:-}; do PICK[$r]=1; done
+            fi
+          done
+
+          STAGES=""
+          for s in $ORDER; do
+            if [ -n "${PICK[$s]:-}" ]; then
+              if ls "$s"/*.tf >/dev/null 2>&1; then STAGES="$STAGES $s"; else echo "$s: not written yet, skipped"; fi
+            fi
+          done
+          echo "stages=$(printf '%s\n' $STAGES | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+          echo "bootstrap=$BOOT" >> "$GITHUB_OUTPUT"
+          echo "Stages, in order:${STAGES:- none}"
+          echo "0-bootstrap changed: $BOOT"
+
+  validate:
+    name: Validate
+    needs: detect-changed-stages
+    if: needs.detect-changed-stages.outputs.stages != '[]' || needs.detect-changed-stages.outputs.bootstrap == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate
+        env:
+          STAGES: ${{ needs.detect-changed-stages.outputs.stages }}
+          BOOTSTRAP: ${{ needs.detect-changed-stages.outputs.bootstrap }}
+        run: |
+          list=$(echo "$STAGES" | jq -r '.[]')
+          if [ "$BOOTSTRAP" = true ]; then list="0-bootstrap $list"; fi
+          for stage in $list; do
+            echo "::group::$stage"
+            terraform -chdir="$stage" init -backend=false
+            terraform -chdir="$stage" validate
+            echo "::endgroup::"
+          done
+
+  # Manual run with action = auth-check: signs in and lists the state bucket,
+  # nothing else.
+  auth-check:
+    name: Auth check
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'auth-check'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check repository variables
+        env:
+          PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SA: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$PROVIDER" ] || [ -z "$SA" ]; then
+            echo "::error::Set the repository variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT (Settings > Secrets and variables > Actions > Variables) from the 0-bootstrap outputs."
+            exit 1
+          fi
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Who am I, and can I reach the state bucket
+        run: |
+          gcloud auth list
+          bucket=$(yq '.gcp.state_bucket' config.yaml)
+          gcloud storage ls "gs://$bucket/"
+
+  terraform:
+    name: ${{ matrix.stage }}
+    needs: [detect-changed-stages, validate]
+    if: >-
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      && inputs.action != 'auth-check'
+      && needs.detect-changed-stages.outputs.stages != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      # One at a time, in ORDER: each stage reads the state of the ones
+      # before it. Stop at the first failure so nothing builds on a broken stage.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        stage: ${{ fromJSON(needs.detect-changed-stages.outputs.stages) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.stage }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check repository variables
+        env:
+          PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SA: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$PROVIDER" ] || [ -z "$SA" ]; then
+            echo "::error::Set the repository variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT (Settings > Secrets and variables > Actions > Variables) from the 0-bootstrap outputs."
+            exit 1
+          fi
+
+      # Workload Identity Federation: GitHub's OIDC token is exchanged for
+      # sa-terraform credentials; no key exists.
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="$GITHUB_WORKSPACE/backend.conf"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          if [ "$code" = 1 ]; then exit 1; fi
+          echo "changes=$([ "$code" = 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$code" = 2 ]; then
+            echo "### ${{ matrix.stage }}: changes" >> "$GITHUB_STEP_SUMMARY"
+            { echo '```'; terraform show -no-color tfplan | tail -n 200; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ${{ matrix.stage }}: no changes" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Terraform Apply
+        if: steps.plan.outputs.changes == 'true' && (github.event_name == 'push' || inputs.action == 'apply')
+        run: terraform apply tfplan

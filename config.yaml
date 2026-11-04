@@ -1,0 +1,51 @@
+# Every setting of the landing zone. Each stage reads this file; nothing is
+# hard-coded in the Terraform.
+
+gcp:
+  org_id: "1085796438163"
+  domain: "nasir.id"
+  customer_id: "C0384bjrt"                # Cloud Identity customer, for domain-restricted sharing
+  billing_account: "017E13-779EF0-74B8F6"
+  region: "asia-southeast1"
+  state_bucket: "nasir-terraform-state-bucket"   # must match backend.conf
+
+# Names follow Google's security foundations blueprint:
+#   folders   fldr-<name>                      fldr-common
+#   projects  prj-<env code>-<name>-<random>   prj-c-logging-a1b2
+#   networks  vpc-<env code>-shared-base       vpc-p-shared-base
+#   subnets   sb-<env code>-shared-base-<region>
+naming:
+  folder_prefix: "fldr"
+  project_prefix: "prj"
+  env_codes:
+    bootstrap: "b"
+    common: "c"
+    production: "p"
+    nonproduction: "n"
+
+github:
+  repo: "nasir19noor/gcp"
+  repo_id: "1445073393"                   # immutable: survives renames and transfers
+  branch: "main"
+
+# Created by hand in admin.google.com -> Directory -> Groups.
+groups:
+  org_admins: "gcp@nasir.id"
+  billing_admins: "gcp-billing@nasir.id"
+  network_admins: "gcp-network@nasir.id"
+  security_admins: "gcp-security@nasir.id"
+  devops: "gcp-devops@nasir.id"
+  developers: "gcp-developers@nasir.id"
+
+# 0-bootstrap
+bootstrap:
+  service_account: "sa-terraform"
+  wif_pool: "github"
+  wif_provider: "github-actions"
+
+# 2-env and 3-networks
+environments:
+  production:
+    cidr: "10.10.0.0/16"
+  nonproduction:
+    cidr: "10.20.0.0/16"
