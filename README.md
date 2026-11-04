@@ -13,9 +13,9 @@ no interconnect and no VPC Service Controls, and settings live in one
 `config.yaml` instead of `terraform.tfvars` per stage.
 
 > **Status:** `0-bootstrap` is applied (project `prj-b-seed-9d42`), the
-> GitHub Actions workflow works, and `1-org/envs/shared` is written. The
-> other stages are added one by one in the order below. This README is
-> updated with every change.
+> GitHub Actions workflow works, `1-org/envs/shared` is deployed, and
+> `2-env` and `3-networks` are written, with only free resources (Cloud NAT
+> off). `4-projects` comes later. This README is updated with every change.
 
 ## Decisions
 
@@ -72,11 +72,13 @@ gcp/
 ├── 0-bootstrap/                      by hand, once
 ├── 1-org/envs/shared/                org policies, org IAM, essential contacts, fldr-common,
 │                                     prj-c-logging, prj-c-billing
-├── 2-env/envs/production/            fldr-production and its IAM
-├── 2-env/envs/nonproduction/         fldr-nonproduction and its IAM
-├── 3-networks/envs/production/       prj-p-shared-base: VPC, subnet, Cloud NAT, firewall baseline
-├── 3-networks/envs/nonproduction/    prj-n-shared-base
+├── 2-env/envs/production/            fldr-production and its IAM (calls modules/env_baseline)
+├── 2-env/envs/nonproduction/         fldr-nonproduction and its IAM (same files, other state)
+├── 3-networks/envs/production/       prj-p-shared-base: Shared VPC, subnet, firewall baseline (calls modules/base_shared_vpc)
+├── 3-networks/envs/nonproduction/    prj-n-shared-base (same files, other state)
 ├── 4-projects/                       (later) application projects, attached to the Shared VPCs
+├── modules/env_baseline/             one environment: folder and folder IAM
+├── modules/base_shared_vpc/          one environment's network: host project, VPC, subnet, firewall, optional NAT
 ├── docs/                             (later) detailed guide and diagrams
 └── .github/workflows/terraform.yml   CI/CD: deploys the changed stages
 ```
@@ -180,7 +182,7 @@ Push to `main`. The workflow applies the changed stages one at a time, in this o
 |---|---|---|
 | 1 | `1-org/envs/shared` | See [1-org](#1-org-envsshared) below |
 | 2 | `2-env/envs/production`, `2-env/envs/nonproduction` | `fldr-production`, `fldr-nonproduction` and their IAM for devops and developers |
-| 3 | `3-networks/envs/production`, `3-networks/envs/nonproduction` | `prj-<p\|n>-shared-base` as Shared VPC host; `vpc-<p\|n>-shared-base` with subnet `sb-<p\|n>-shared-base-asia-southeast1` and Private Google Access; Cloud Router and Cloud NAT; firewall baseline (deny by default, IAP SSH, internal traffic) |
+| 3 | `3-networks/envs/production`, `3-networks/envs/nonproduction` | See [3-networks](#3-networks-envsproduction-envsnonproduction) below |
 | 4 | `4-projects` | Later: application projects from `config.yaml`, attached to the right Shared VPC |
 
 ### 1-org (envs/shared)
@@ -227,6 +229,57 @@ Notes:
   role to a non-nasir.id identity (e.g. the GitHub Workload Identity
   `principalSet`) may be refused. Existing grants are unaffected.
 
+### 2-env (envs/production, envs/nonproduction)
+
+Both folders hold the same files and call `modules/env_baseline`; only the
+state prefix in `backend.tf` differs. The environment is the folder's name,
+and its settings are `environments.<env>` in `config.yaml`. Each creates:
+
+- folder `fldr-<env>` under the organization, protected from deletion;
+- the roles in `environments.<env>.folder_roles` on that folder, inherited
+  by every project later created in it:
+
+  | Folder | `gcp-devops@nasir.id` | `gcp-developers@nasir.id` |
+  |---|---|---|
+  | `fldr-production` | Editor | Viewer |
+  | `fldr-nonproduction` | Editor | Editor |
+
+To add an environment, copy `2-env/envs/nonproduction` to the new name,
+change the prefix in its `backend.tf`, add it under `environments` and
+`naming.env_codes` in `config.yaml`, and add it to `ORDER` and `READERS` in
+the workflow.
+
+### 3-networks (envs/production, envs/nonproduction)
+
+Same pattern as 2-env: both folders call `modules/base_shared_vpc`, and the
+settings are `environments.<env>` and `network` in `config.yaml`. The VPC
+and firewall use the `vpc` and `firewall` modules of
+[nasir19noor/terraform](https://github.com/nasir19noor/terraform/tree/main/gcp/modules),
+pinned to a commit. The subnet is a plain resource, because that repo's
+`subnets` module doesn't work with google provider 6 and later. Each
+environment gets:
+
+| Resource | production | nonproduction |
+|---|---|---|
+| Host project, in `fldr-<env>` | `prj-p-shared-base-<random>` | `prj-n-shared-base-<random>` |
+| Shared VPC (global routing) | `vpc-p-shared-base` | `vpc-n-shared-base` |
+| Subnet in `asia-southeast1`, Private Google Access on, flow logs off | `sb-p-shared-base-asia-southeast1`, `10.10.0.0/20` | `sb-n-shared-base-asia-southeast1`, `10.20.0.0/20` |
+| Firewall: SSH from IAP (`35.235.240.0/20`), TCP 22 | `fw-p-shared-base-allow-iap-ssh` | `fw-n-shared-base-allow-iap-ssh` |
+| Firewall: all traffic from inside the environment's `/16` | `fw-p-shared-base-allow-internal` | `fw-n-shared-base-allow-internal` |
+| Cloud Router and Cloud NAT | off (`nat: false`) | off (`nat: false`) |
+
+Everything else coming in is denied by GCP's implied rule, and all outgoing
+traffic is allowed. The `/16` is reserved for the environment, and the first
+`/20` is its subnet.
+
+Without Cloud NAT, a VM needs a public IP to reach the internet; Google APIs
+work without one, through Private Google Access. To turn NAT on, set
+`nat: true` for the environment in `config.yaml` and push. That adds
+`cr-<p|n>-shared-base-asia-southeast1` and `nat-<p|n>-shared-base-asia-southeast1`.
+
+Application projects in `4-projects` will be attached to these Shared VPCs
+as service projects.
+
 ## CI/CD
 
 [.github/workflows/terraform.yml](.github/workflows/terraform.yml) runs on
@@ -239,8 +292,8 @@ Notes:
   (`google-github-actions/auth`), then plan and apply only the changed
   stages, one job per stage, one at a time, in the order above. It stops at
   the first failure. A stage that reads a changed stage's outputs is
-  included too. A change to `config.yaml`, `backend.conf` or the workflow
-  deploys every stage. Each plan is shown in the run summary.
+  included too. A change to `config.yaml`, `backend.conf`, `modules/` or
+  the workflow deploys every stage. Each plan is shown in the run summary.
 - **Manual run** (Actions → terraform → Run workflow), with:
   - `action`: `plan`, `apply` (plan, then apply), or `auth-check` (sign in
     and list the state bucket only);
@@ -252,9 +305,11 @@ is never applied by CI.
 
 ## Cost
 
-Folders, org policies, IAM, Shared VPC and Workload Identity Federation are
-free. What costs money:
+Everything deployed so far is free: folders, projects, org policies, IAM,
+Workload Identity Federation, the Shared VPCs, subnets and firewall rules.
+What would cost money:
 
-- Cloud NAT: one gateway per environment, an hourly charge plus data processed;
-- log storage beyond the free allowance;
-- VPC Flow Logs, which are off by default.
+- Cloud NAT, off for now: an hourly charge per gateway, plus data processed;
+- log storage beyond the free allowance (the audit log bucket keeps 30 days);
+- VPC Flow Logs and Data Access audit logs, both off;
+- whatever runs in application projects: VMs, public IPs, egress.

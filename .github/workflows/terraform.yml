@@ -10,7 +10,7 @@ name: terraform
 # The stages read each other's outputs through terraform_remote_state, so:
 #   - the jobs run one at a time, in ORDER, and stop at the first failure;
 #   - a changed stage also brings in the stages that read its outputs;
-#   - config.yaml, backend.conf or this file changing deploys every stage.
+#   - config.yaml, backend.conf, modules/ or this file changing deploys every stage.
 # 0-bootstrap is applied by hand and only validated here. Stages listed in
 # ORDER that don't exist yet are skipped.
 
@@ -22,6 +22,7 @@ on:
       - "2-env/**"
       - "3-networks/**"
       - "4-projects/**"
+      - "modules/**"
       - "config.yaml"
       - "backend.conf"
       - ".github/workflows/terraform.yml"
@@ -32,6 +33,7 @@ on:
       - "2-env/**"
       - "3-networks/**"
       - "4-projects/**"
+      - "modules/**"
       - "config.yaml"
       - "backend.conf"
       - ".github/workflows/terraform.yml"
@@ -116,7 +118,8 @@ jobs:
           else
             CHANGED=$(git diff --name-only "$BASE" "$AFTER")
             echo "Changed files:"; echo "$CHANGED"
-            if echo "$CHANGED" | grep -qE '^(config\.yaml|backend\.conf|\.github/workflows/terraform\.yml)$'; then
+            # A shared module can be used by any stage.
+            if echo "$CHANGED" | grep -qE '^(config\.yaml|backend\.conf|\.github/workflows/terraform\.yml|modules/.*)$'; then
               for s in $ORDER; do PICK[$s]=1; done
             fi
             for s in $ORDER; do

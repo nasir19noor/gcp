@@ -45,12 +45,31 @@ bootstrap:
   wif_pool: "github"
   wif_provider: "github-actions"
 
-# 2-env and 3-networks
+# 2-env and 3-networks.
+#   cidr          the environment's whole range, reserved for its subnets
+#   subnet        the first subnet, in gcp.region, taken from cidr
+#   nat           Cloud NAT for VMs without a public IP (billed hourly)
+#   folder_roles  roles on fldr-<env>, by principal
 environments:
   production:
     cidr: "10.10.0.0/16"
+    subnet: "10.10.0.0/20"
+    nat: false
+    folder_roles:
+      devops: ["roles/editor"]
+      developers: ["roles/viewer"]
   nonproduction:
     cidr: "10.20.0.0/16"
+    subnet: "10.20.0.0/20"
+    nat: false
+    folder_roles:
+      devops: ["roles/editor"]
+      developers: ["roles/editor"]
+
+# 3-networks: firewall baseline. Ingress not allowed here is denied (GCP's
+# implied deny rule).
+network:
+  iap_ranges: ["35.235.240.0/20"]   # Identity-Aware Proxy, for SSH without public IPs
 
 # 1-org/envs/shared
 org:
