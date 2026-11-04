@@ -37,7 +37,7 @@ principals:
   network_admins: "user:gcp-network@nasir.id"
   security_admins: "user:gcp-security@nasir.id"
   devops: "user:gcp-devops@nasir.id"
-  developers: "user:gcp-developers@nasir.id"
+  developers: "user:gcp-developer@nasir.id"
 
 # 0-bootstrap
 bootstrap:
