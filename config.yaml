@@ -28,14 +28,16 @@ github:
   repo_id: "1445073393"                   # immutable: survives renames and transfers
   branch: "main"
 
-# Created by hand in admin.google.com -> Directory -> Groups.
-groups:
-  org_admins: "gcp@nasir.id"
-  billing_admins: "gcp-billing@nasir.id"
-  network_admins: "gcp-network@nasir.id"
-  security_admins: "gcp-security@nasir.id"
-  devops: "gcp-devops@nasir.id"
-  developers: "gcp-developers@nasir.id"
+# IAM members, with their type: "user:", "group:" or "serviceAccount:".
+# These are users for now; to switch to Google groups later, create the group
+# and change the prefix to "group:".
+principals:
+  org_admins: "user:gcp@nasir.id"
+  billing_admins: "user:gcp-billing@nasir.id"
+  network_admins: "user:gcp-network@nasir.id"
+  security_admins: "user:gcp-security@nasir.id"
+  devops: "user:gcp-devops@nasir.id"
+  developers: "user:gcp-developers@nasir.id"
 
 # 0-bootstrap
 bootstrap:
@@ -49,3 +51,29 @@ environments:
     cidr: "10.10.0.0/16"
   nonproduction:
     cidr: "10.20.0.0/16"
+
+# 1-org/envs/shared
+org:
+  essential_contact: "nasir@nasir.id"     # Google's security, billing, legal and technical notices
+  log_retention_days: 30                  # central audit log bucket in prj-c-logging
+  budget:                                 # whole billing account, monthly
+    amount: 50000                        # about USD 10
+    currency: "IDR"                       # must be the billing account's currency
+    alert_at: [0.5, 0.9, 1.0]             # of the amount; e-mailed to essential_contact
+  policies:
+    # Boolean org policy constraints, enforced on the whole organization.
+    # compute.vmExternalIpAccess is deliberately not set: VMs may have public IPs.
+    enforce:
+      - iam.disableServiceAccountKeyCreation
+      - iam.disableServiceAccountKeyUpload
+      - iam.automaticIamGrantsForDefaultServiceAccounts
+      - compute.skipDefaultNetworkCreation
+      - compute.requireOsLogin
+      - compute.disableSerialPortAccess
+      - compute.disableNestedVirtualization
+      - compute.disableGuestAttributesAccess
+      - compute.restrictXpnProjectLienRemoval
+      - storage.uniformBucketLevelAccess
+      - storage.publicAccessPrevention
+    allowed_locations: ["in:asia-southeast1-locations"]
+    # iam.allowedPolicyMemberDomains is set to gcp.customer_id (nasir.id only).
